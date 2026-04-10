@@ -1,0 +1,333 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "Web Crawler API",
+    "version": "1.0.0",
+    "description": "A web crawler API that lets authenticated users submit URLs for crawling and retrieve structured results."
+  },
+  "servers": [
+    { "url": "http://localhost:3000" }
+  ],
+  "components": {
+    "securitySchemes": {
+      "bearerAuth": {
+        "type": "http",
+        "scheme": "bearer",
+        "bearerFormat": "JWT"
+      }
+    },
+    "schemas": {
+      "AuthInput": {
+        "type": "object",
+        "required": ["email", "password"],
+        "properties": {
+          "email": { "type": "string", "format": "email" },
+          "password": { "type": "string", "minLength": 1 }
+        }
+      },
+      "TokenResponse": {
+        "type": "object",
+        "properties": {
+          "token": { "type": "string" }
+        }
+      },
+      "CrawlJobSummary": {
+        "type": "object",
+        "properties": {
+          "id": { "type": "string", "format": "uuid" },
+          "url": { "type": "string", "format": "uri" },
+          "maxDepth": { "type": "integer" },
+          "status": { "type": "string", "enum": ["PENDING", "RUNNING", "COMPLETED", "FAILED"] },
+          "createdAt": { "type": "string", "format": "date-time" },
+          "startedAt": { "type": "string", "format": "date-time", "nullable": true },
+          "completedAt": { "type": "string", "format": "date-time", "nullable": true },
+          "resultCount": { "type": "integer" }
+        }
+      },
+      "CrawlResult": {
+        "type": "object",
+        "properties": {
+          "id": { "type": "string", "format": "uuid" },
+          "url": { "type": "string", "format": "uri" },
+          "statusCode": { "type": "integer", "nullable": true },
+          "title": { "type": "string", "nullable": true },
+          "depth": { "type": "integer" },
+          "linkCount": { "type": "integer" },
+          "error": { "type": "string", "nullable": true },
+          "crawledAt": { "type": "string", "format": "date-time" }
+        }
+      },
+      "CrawlJobDetail": {
+        "type": "object",
+        "properties": {
+          "id": { "type": "string", "format": "uuid" },
+          "url": { "type": "string", "format": "uri" },
+          "maxDepth": { "type": "integer" },
+          "status": { "type": "string", "enum": ["PENDING", "RUNNING", "COMPLETED", "FAILED"] },
+          "createdAt": { "type": "string", "format": "date-time" },
+          "startedAt": { "type": "string", "format": "date-time", "nullable": true },
+          "completedAt": { "type": "string", "format": "date-time", "nullable": true },
+          "results": {
+            "type": "array",
+            "items": { "$ref": "#/components/schemas/CrawlResult" }
+          }
+        }
+      },
+      "Error": {
+        "type": "object",
+        "properties": {
+          "message": { "type": "string" }
+        }
+      }
+    }
+  },
+  "paths": {
+    "/api/signup": {
+      "post": {
+        "tags": ["Auth"],
+        "summary": "Create a new account",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/AuthInput" }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Account created",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/TokenResponse" }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid input",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/Error" }
+              }
+            }
+          },
+          "409": {
+            "description": "Email already in use",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/Error" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/login": {
+      "post": {
+        "tags": ["Auth"],
+        "summary": "Log in to an existing account",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/AuthInput" }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Login successful",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/TokenResponse" }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid input",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/Error" }
+              }
+            }
+          },
+          "401": {
+            "description": "Invalid credentials",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/Error" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/crawl-jobs": {
+      "get": {
+        "tags": ["Crawl Jobs"],
+        "summary": "List crawl jobs for the authenticated user",
+        "security": [{ "bearerAuth": [] }],
+        "parameters": [
+          {
+            "name": "cursor",
+            "in": "query",
+            "schema": { "type": "integer", "default": 0 }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "schema": { "type": "integer", "default": 20 }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Paginated list of crawl jobs",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "crawlJobs": {
+                      "type": "array",
+                      "items": { "$ref": "#/components/schemas/CrawlJobSummary" }
+                    },
+                    "nextCursor": { "type": "integer", "nullable": true }
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Not authenticated",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/Error" }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "tags": ["Crawl Jobs"],
+        "summary": "Submit a new URL for crawling",
+        "security": [{ "bearerAuth": [] }],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["url"],
+                "properties": {
+                  "url": { "type": "string", "format": "uri" },
+                  "maxDepth": { "type": "integer", "minimum": 0, "maximum": 5, "default": 2 }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Crawl job created and started",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/CrawlJobSummary" }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid input",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/Error" }
+              }
+            }
+          },
+          "401": {
+            "description": "Not authenticated",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/Error" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/crawl-jobs/{id}": {
+      "get": {
+        "tags": ["Crawl Jobs"],
+        "summary": "Get a crawl job with its results",
+        "security": [{ "bearerAuth": [] }],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": { "type": "string", "format": "uuid" }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Crawl job details with results",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/CrawlJobDetail" }
+              }
+            }
+          },
+          "401": {
+            "description": "Not authenticated",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/Error" }
+              }
+            }
+          },
+          "404": {
+            "description": "Crawl job not found",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/Error" }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "tags": ["Crawl Jobs"],
+        "summary": "Delete a crawl job and its results",
+        "security": [{ "bearerAuth": [] }],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": { "type": "string", "format": "uuid" }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Crawl job deleted"
+          },
+          "401": {
+            "description": "Not authenticated",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/Error" }
+              }
+            }
+          },
+          "404": {
+            "description": "Crawl job not found",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/Error" }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}

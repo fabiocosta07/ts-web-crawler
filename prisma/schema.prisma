@@ -1,0 +1,51 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id        String     @id @default(uuid())
+  email     String     @unique
+  password  String
+  createdAt DateTime   @default(now())
+  crawlJobs CrawlJob[]
+}
+
+model CrawlJob {
+  id          String        @id @default(uuid())
+  url         String
+  maxDepth    Int           @default(2)
+  status      CrawlStatus   @default(PENDING)
+  createdAt   DateTime      @default(now())
+  startedAt   DateTime?
+  completedAt DateTime?
+  userId      String
+  user        User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+  results     CrawlResult[]
+}
+
+model CrawlResult {
+  id         String   @id @default(uuid())
+  url        String
+  statusCode Int?
+  title      String?
+  depth      Int
+  links      String[]
+  error      String?
+  crawledAt  DateTime @default(now())
+  crawlJobId String
+  crawlJob   CrawlJob @relation(fields: [crawlJobId], references: [id], onDelete: Cascade)
+
+  @@unique([crawlJobId, url])
+}
+
+enum CrawlStatus {
+  PENDING
+  RUNNING
+  COMPLETED
+  FAILED
+}
