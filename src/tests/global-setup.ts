@@ -22,7 +22,7 @@ export async function setup({ provide }: GlobalSetupContext) {
 
   const databaseUrl = container.getConnectionUri();
 
-  execSync('npx prisma migrate deploy', {
+  execSync('npx prisma db push --skip-generate --accept-data-loss', {
     env: { ...process.env, DATABASE_URL: databaseUrl },
     stdio: 'pipe',
   });

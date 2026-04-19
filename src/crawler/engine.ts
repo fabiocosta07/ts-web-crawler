@@ -1,4 +1,5 @@
 import * as cheerio from 'cheerio';
+import { CrawlStatus } from '@prisma/client';
 import { prisma } from '../lib/prisma.js';
 
 interface CrawlOptions {
@@ -16,14 +17,15 @@ interface PageResult {
   depth: number;
 }
 
-/**
- * Normalise a URL by removing the fragment and trailing slash.
- */
+const FETCH_TIMEOUT_MS = 10_000;
+const MAX_BODY_BYTES = 2 * 1024 * 1024;
+const CONCURRENCY = Number(process.env.CRAWL_CONCURRENCY ?? 5);
+const MAX_PAGES_PER_JOB = Number(process.env.MAX_PAGES_PER_JOB ?? 500);
+
 function normalizeUrl(raw: string, base: string): string | null {
   try {
     const url = new URL(raw, base);
     url.hash = '';
-    // Remove trailing slash for consistency (except root path)
     let href = url.href;
     if (href.endsWith('/') && url.pathname !== '/') {
       href = href.slice(0, -1);
@@ -34,13 +36,34 @@ function normalizeUrl(raw: string, base: string): string | null {
   }
 }
 
-/**
- * Fetch a single page and extract its title and links.
- */
+async function readBodyCapped(response: Response, maxBytes: number): Promise<string | null> {
+  if (!response.body) return await response.text();
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder('utf-8');
+  let total = 0;
+  let out = '';
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    total += value.byteLength;
+    if (total > maxBytes) {
+      try {
+        await reader.cancel();
+      } catch {
+        /* ignore */
+      }
+      return null;
+    }
+    out += decoder.decode(value, { stream: true });
+  }
+  out += decoder.decode();
+  return out;
+}
+
 async function fetchPage(url: string): Promise<Omit<PageResult, 'depth'>> {
   try {
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 10_000);
+    const timeout = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
 
     const response = await fetch(url, {
       signal: controller.signal,
@@ -64,7 +87,17 @@ async function fetchPage(url: string): Promise<Omit<PageResult, 'depth'>> {
       };
     }
 
-    const html = await response.text();
+    const html = await readBodyCapped(response, MAX_BODY_BYTES);
+    if (html === null) {
+      return {
+        url,
+        statusCode: response.status,
+        title: null,
+        links: [],
+        error: `Response exceeded ${MAX_BODY_BYTES} bytes`,
+      };
+    }
+
     const $ = cheerio.load(html);
     const title = $('title').first().text().trim() || null;
 
@@ -97,56 +130,86 @@ async function fetchPage(url: string): Promise<Omit<PageResult, 'depth'>> {
   }
 }
 
-/**
- * Run a breadth-first crawl starting from the given URL up to maxDepth levels.
- * Results are persisted to the database as they are discovered.
- */
+async function processUrl(
+  url: string,
+  depth: number,
+  jobId: string,
+): Promise<string[]> {
+  const page = await fetchPage(url);
+
+  await prisma.crawlResult.upsert({
+    where: { crawlJobId_url: { crawlJobId: jobId, url: page.url } },
+    update: {
+      statusCode: page.statusCode,
+      title: page.title,
+      links: page.links,
+      error: page.error,
+    },
+    create: {
+      crawlJobId: jobId,
+      url: page.url,
+      statusCode: page.statusCode,
+      title: page.title,
+      depth,
+      links: page.links,
+      error: page.error,
+    },
+  });
+
+  return page.links;
+}
+
+async function mapWithConcurrency<T, R>(
+  items: T[],
+  limit: number,
+  worker: (item: T) => Promise<R>,
+): Promise<R[]> {
+  const results: R[] = new Array(items.length);
+  let next = 0;
+  const runners = Array.from({ length: Math.min(limit, items.length) }, async () => {
+    while (true) {
+      const i = next++;
+      if (i >= items.length) return;
+      results[i] = await worker(items[i]);
+    }
+  });
+  await Promise.all(runners);
+  return results;
+}
+
 export async function runCrawl({ jobId, startUrl, maxDepth }: CrawlOptions): Promise<void> {
   await prisma.crawlJob.update({
     where: { id: jobId },
-    data: { status: 'RUNNING', startedAt: new Date() },
+    data: { status: CrawlStatus.RUNNING, startedAt: new Date() },
   });
 
+  const origin = new URL(startUrl).origin;
   const visited = new Set<string>();
   let currentLevel: string[] = [startUrl];
   let depth = 0;
 
   try {
     while (currentLevel.length > 0 && depth <= maxDepth) {
-      const nextLevel: string[] = [];
+      const remaining = MAX_PAGES_PER_JOB - visited.size;
+      if (remaining <= 0) break;
 
+      const toFetch: string[] = [];
       for (const url of currentLevel) {
         if (visited.has(url)) continue;
+        if (toFetch.length >= remaining) break;
         visited.add(url);
+        toFetch.push(url);
+      }
 
-        const page = await fetchPage(url);
+      const capturedDepth = depth;
+      const linksPerUrl = await mapWithConcurrency(toFetch, CONCURRENCY, (url) =>
+        processUrl(url, capturedDepth, jobId),
+      );
 
-        // Persist result (upsert to handle duplicates gracefully)
-        await prisma.crawlResult.upsert({
-          where: {
-            crawlJobId_url: { crawlJobId: jobId, url: page.url },
-          },
-          update: {
-            statusCode: page.statusCode,
-            title: page.title,
-            links: page.links,
-            error: page.error,
-          },
-          create: {
-            crawlJobId: jobId,
-            url: page.url,
-            statusCode: page.statusCode,
-            title: page.title,
-            depth,
-            links: page.links,
-            error: page.error,
-          },
-        });
-
-        // Only follow links within the same origin and below maxDepth
-        if (depth < maxDepth) {
-          const origin = new URL(startUrl).origin;
-          for (const link of page.links) {
+      const nextLevel: string[] = [];
+      if (depth < maxDepth) {
+        for (const links of linksPerUrl) {
+          for (const link of links) {
             if (link.startsWith(origin) && !visited.has(link)) {
               nextLevel.push(link);
             }
@@ -160,16 +223,17 @@ export async function runCrawl({ jobId, startUrl, maxDepth }: CrawlOptions): Pro
 
     await prisma.crawlJob.update({
       where: { id: jobId },
-      data: { status: 'COMPLETED', completedAt: new Date() },
+      data: { status: CrawlStatus.COMPLETED, completedAt: new Date() },
     });
   } catch (err) {
-    await prisma.crawlJob.update({
-      where: { id: jobId },
-      data: {
-        status: 'FAILED',
-        completedAt: new Date(),
-      },
-    });
+    try {
+      await prisma.crawlJob.update({
+        where: { id: jobId },
+        data: { status: CrawlStatus.FAILED, completedAt: new Date() },
+      });
+    } catch (updateErr) {
+      console.error(`Failed to persist FAILED status for job ${jobId}:`, updateErr);
+    }
     throw err;
   }
 }

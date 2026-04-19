@@ -2,25 +2,42 @@ import { Router } from 'express';
 import { z } from 'zod/v4';
 import { prisma } from '../lib/prisma.js';
 import type { AuthRequest } from '../middleware/auth.js';
+import { validateBody, type ValidatedRequest } from '../middleware/validate.js';
 import { runCrawl } from '../crawler/engine.js';
 
 export const crawlJobsRouter = Router();
 
+const paginationSchema = z.object({
+  cursor: z.coerce.number().int().min(0).default(0),
+  limit: z.coerce.number().int().min(1).max(100).default(20),
+});
+
+function parsePagination(query: unknown): { cursor: number; limit: number } | null {
+  const parsed = paginationSchema.safeParse(query);
+  return parsed.success ? parsed.data : null;
+}
+
 // GET /api/crawl-jobs?cursor=0&limit=20
-crawlJobsRouter.get('/', async (req: AuthRequest, res) => {
-  const cursor = Number(req.query.cursor ?? 0);
-  const limit = Number(req.query.limit ?? 20);
+crawlJobsRouter.get('/', async (req, res) => {
+  const { userId } = req as unknown as AuthRequest;
+  const page = parsePagination(req.query);
+  if (!page) {
+    res.status(400).json({ message: 'Invalid query parameters' });
+    return;
+  }
 
-  const items = await prisma.crawlJob.findMany({
-    where: { userId: req.userId },
-    skip: cursor,
-    take: limit,
-    orderBy: { createdAt: 'desc' },
-    include: { _count: { select: { results: true } } },
-  });
+  const [items, total] = await Promise.all([
+    prisma.crawlJob.findMany({
+      where: { userId },
+      skip: page.cursor,
+      take: page.limit,
+      orderBy: { createdAt: 'desc' },
+      include: { _count: { select: { results: true } } },
+    }),
+    prisma.crawlJob.count({ where: { userId } }),
+  ]);
 
-  const total = await prisma.crawlJob.count({ where: { userId: req.userId } });
-  const nextCursor = cursor + limit < total ? cursor + limit : null;
+  const nextCursor = page.cursor + page.limit < total ? page.cursor + page.limit : null;
 
   res.json({
     crawlJobs: items.map((item) => ({
@@ -37,32 +54,45 @@ crawlJobsRouter.get('/', async (req: AuthRequest, res) => {
   });
 });
 
-// GET /api/crawl-jobs/:id
-crawlJobsRouter.get('/:id', async (req: AuthRequest, res) => {
-  const id = String(req.params.id);
-  const item = await prisma.crawlJob.findUnique({
-    where: { id },
-    include: {
-      results: {
-        orderBy: { depth: 'asc' },
-      },
-    },
+// GET /api/crawl-jobs/:id?cursor=0&limit=20
+crawlJobsRouter.get('/:id', async (req, res) => {
+  const { userId } = req as unknown as AuthRequest;
+  const page = parsePagination(req.query);
+  if (!page) {
+    res.status(400).json({ message: 'Invalid query parameters' });
+    return;
+  }
+
+  const job = await prisma.crawlJob.findFirst({
+    where: { id: req.params.id, userId },
+    include: { _count: { select: { results: true } } },
   });
 
-  if (!item || item.userId !== req.userId) {
+  if (!job) {
     res.status(404).json({ message: 'Not found' });
     return;
   }
 
+  const results = await prisma.crawlResult.findMany({
+    where: { crawlJobId: job.id },
+    orderBy: [{ depth: 'asc' }, { crawledAt: 'asc' }],
+    skip: page.cursor,
+    take: page.limit,
+  });
+
+  const nextCursor =
+    page.cursor + page.limit < job._count.results ? page.cursor + page.limit : null;
+
   res.json({
-    id: item.id,
-    url: item.url,
-    maxDepth: item.maxDepth,
-    status: item.status,
-    createdAt: item.createdAt,
-    startedAt: item.startedAt,
-    completedAt: item.completedAt,
-    results: item.results.map((r) => ({
+    id: job.id,
+    url: job.url,
+    maxDepth: job.maxDepth,
+    status: job.status,
+    createdAt: job.createdAt,
+    startedAt: job.startedAt,
+    completedAt: job.completedAt,
+    resultCount: job._count.results,
+    results: results.map((r) => ({
       id: r.id,
       url: r.url,
       statusCode: r.statusCode,
@@ -72,6 +102,7 @@ crawlJobsRouter.get('/:id', async (req: AuthRequest, res) => {
       error: r.error,
       crawledAt: r.crawledAt,
     })),
+    nextCursor,
   });
 });
 
@@ -79,29 +110,21 @@ const createCrawlJobSchema = z.object({
   url: z.url(),
   maxDepth: z.number().int().min(0).max(5).optional(),
 });
+type CreateCrawlJobBody = z.infer<typeof createCrawlJobSchema>;
 
 // POST /api/crawl-jobs
-crawlJobsRouter.post('/', async (req: AuthRequest, res) => {
-  const parsed = createCrawlJobSchema.safeParse(req.body);
-  if (!parsed.success) {
-    res.status(400).json({ message: 'Invalid input' });
-    return;
-  }
-
-  const { url, maxDepth } = parsed.data;
+crawlJobsRouter.post('/', validateBody(createCrawlJobSchema), async (req, res) => {
+  const { userId } = req as unknown as AuthRequest;
+  const { url, maxDepth } = (req as ValidatedRequest<CreateCrawlJobBody>).validated;
+  const depth = maxDepth ?? 2;
 
   const job = await prisma.crawlJob.create({
-    data: {
-      url,
-      maxDepth: maxDepth ?? 2,
-      userId: req.userId!,
-    },
+    data: { url, maxDepth: depth, userId },
   });
 
-  // Fire-and-forget: start crawling in the background
-  runCrawl({ jobId: job.id, startUrl: url, maxDepth: maxDepth ?? 2 }).catch(
-    (err) => console.error(`Crawl job ${job.id} failed:`, err),
-  );
+  runCrawl({ jobId: job.id, startUrl: url, maxDepth: depth }).catch((err) => {
+    console.error(`Crawl job ${job.id} failed:`, err);
+  });
 
   res.status(201).json({
     id: job.id,
@@ -113,21 +136,16 @@ crawlJobsRouter.post('/', async (req: AuthRequest, res) => {
 });
 
 // DELETE /api/crawl-jobs/:id
-crawlJobsRouter.delete('/:id', async (req: AuthRequest, res) => {
-  const id = String(req.params.id);
-  const existing = await prisma.crawlJob.findUnique({
-    where: { id },
+crawlJobsRouter.delete('/:id', async (req, res) => {
+  const { userId } = req as unknown as AuthRequest;
+  const { count } = await prisma.crawlJob.deleteMany({
+    where: { id: req.params.id, userId },
   });
 
-  if (!existing || existing.userId !== req.userId) {
+  if (count === 0) {
     res.status(404).json({ message: 'Not found' });
     return;
   }
 
-  try {
-    await prisma.crawlJob.delete({ where: { id } });
-    res.status(204).end();
-  } catch {
-    res.status(404).json({ message: 'Not found' });
-  }
+  res.status(204).end();
 });
